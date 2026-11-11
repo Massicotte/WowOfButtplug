@@ -58,7 +58,7 @@ frame:SetScript("OnEvent", function(_, event, unit)
             Flash()
         end
         lastHealth = health
-    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" and unit == "player" then
         -- Covers heals given, attacks performed and spells cast: any
         -- successful cast by the player flashes the pixel.
         Flash()
