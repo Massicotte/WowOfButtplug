@@ -226,23 +226,24 @@ func (c *buttplugClient) send(name string, fields map[string]any) error {
 	return c.ws.sendText(data)
 }
 
-// connect starts the handshake. We ask for protocol v4 first; if the server
-// rejects it we retry with v3 (see the Error handler in handleOne).
+// connect starts the handshake. We ask for protocol v3 first (the version
+// today's Intiface servers validate against); if the server rejects it we
+// retry with v4 (see the Error handler in handleOne).
 func (c *buttplugClient) connect() error {
+	return c.send("RequestServerInfo", map[string]any{
+		"ClientName":     "WowOfButtplug",
+		"MessageVersion": 3,
+	})
+}
+
+func (c *buttplugClient) fallbackV4() error {
+	c.mu.Lock()
+	c.version = 4
+	c.mu.Unlock()
 	return c.send("RequestServerInfo", map[string]any{
 		"ClientName":           "WowOfButtplug",
 		"ProtocolVersionMajor": 4,
 		"ProtocolVersionMinor": 0,
-	})
-}
-
-func (c *buttplugClient) fallbackV3() error {
-	c.mu.Lock()
-	c.version = 3
-	c.mu.Unlock()
-	return c.send("RequestServerInfo", map[string]any{
-		"ClientName":     "WowOfButtplug",
-		"MessageVersion": 3,
 	})
 }
 
@@ -320,9 +321,9 @@ func (c *buttplugClient) handleOne(name string, payload json.RawMessage) {
 		handshakePending := c.version == 0
 		c.mu.Unlock()
 		if handshakePending {
-			// Server refused our v4 handshake: retry with v3.
-			fmt.Printf("Server refused protocol v4 (%s), retrying with v3...\n", e.ErrorMessage)
-			_ = c.fallbackV3()
+			// Server refused our v3 handshake: retry with v4.
+			fmt.Printf("Server refused protocol v3 (%s), retrying with v4...\n", e.ErrorMessage)
+			_ = c.fallbackV4()
 			return
 		}
 		fmt.Printf("Server error: %s\n", e.ErrorMessage)
