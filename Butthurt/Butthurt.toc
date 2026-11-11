@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: Butthurt
+## Notes: Alerts when the player takes damage.
+## Author: Maikatura
+## Version: 1.0-forever
+## SavedVariables: ButthurtSavedVariables
+
+Butthurt.lua
