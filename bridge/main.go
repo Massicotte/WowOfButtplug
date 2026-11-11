@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -13,9 +14,9 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 const (
@@ -26,66 +27,11 @@ const (
 	vibeTime    = 500 * time.Millisecond
 )
 
-// ---------------------------------------------------------------- Win32 ----
-
-var (
-	user32 = syscall.NewLazyDLL("user32.dll")
-	gdi32  = syscall.NewLazyDLL("gdi32.dll")
-
-	procGetForegroundWindow = user32.NewProc("GetForegroundWindow")
-	procGetClientRect       = user32.NewProc("GetClientRect")
-	procClientToScreen      = user32.NewProc("ClientToScreen")
-	procGetDC               = user32.NewProc("GetDC")
-	procReleaseDC           = user32.NewProc("ReleaseDC")
-	procGetPixel            = gdi32.NewProc("GetPixel")
-)
-
-type rect struct{ Left, Top, Right, Bottom int32 }
-type point struct{ X, Y int32 }
-
-// clientTopLeft returns the screen coordinates of the top-left corner of the
-// foreground window's client area (where the addon draws its pixel).
-func clientTopLeft() (int32, int32, bool) {
-	hwnd, _, _ := procGetForegroundWindow.Call()
-	if hwnd == 0 {
-		return 0, 0, false
-	}
-	var r rect
-	ret, _, _ := procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
-	if ret == 0 || r.Right <= 0 || r.Bottom <= 0 {
-		return 0, 0, false
-	}
-	p := point{0, 0}
-	ret, _, _ = procClientToScreen.Call(hwnd, uintptr(unsafe.Pointer(&p)))
-	if ret == 0 {
-		return 0, 0, false
-	}
-	return p.X, p.Y, true
-}
-
-// redPixelAt reports whether the pixel at (x, y) is the red the addon flashes.
-func redPixelAt(x, y int32) bool {
-	hwnd, _, _ := procGetForegroundWindow.Call()
-	if hwnd == 0 {
-		return false
-	}
-	hdc, _, _ := procGetDC.Call(hwnd)
-	if hdc == 0 {
-		return false
-	}
-	defer procReleaseDC.Call(hwnd, hdc)
-	cr, _, _ := procGetPixel.Call(hdc, uintptr(x), uintptr(y))
-	// COLORREF: 0x00BBGGRR
-	r := uint8(cr & 0xFF)
-	g := uint8((cr >> 8) & 0xFF)
-	b := uint8((cr >> 16) & 0xFF)
-	return r > 200 && g < 50 && b < 50
-}
-
 // ------------------------------------------------------------ websocket ----
 
 type wsConn struct {
 	conn net.Conn
+	r    *bufio.Reader
 	wmu  sync.Mutex
 }
 
@@ -109,18 +55,28 @@ func dialWebSocket(host, path string) (*wsConn, error) {
 		return nil, err
 	}
 
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
+	r := bufio.NewReader(conn)
+	status, err := r.ReadString('\n')
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	resp := string(buf[:n])
-	if !strings.HasPrefix(resp, "HTTP/1.1 101") && !strings.HasPrefix(resp, "HTTP/1.0 101") {
+	if !strings.Contains(status, "101") {
 		conn.Close()
-		return nil, errors.New("websocket handshake failed: " + strings.TrimSpace(strings.SplitN(resp, "\r\n", 2)[0]))
+		return nil, errors.New("websocket handshake failed: " + strings.TrimSpace(status))
 	}
-	return &wsConn{conn: conn}, nil
+	// Drain the remaining headers up to the empty line.
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+	return &wsConn{conn: conn, r: r}, nil
 }
 
 func (w *wsConn) sendText(data []byte) error {
@@ -160,7 +116,7 @@ func (w *wsConn) writeFrame(opcode byte, data []byte) error {
 func (w *wsConn) readMessage() ([]byte, error) {
 	for {
 		var h [2]byte
-		if _, err := io.ReadFull(w.conn, h[:]); err != nil {
+		if _, err := io.ReadFull(w.r, h[:]); err != nil {
 			return nil, err
 		}
 		fin := h[0]&0x80 != 0
@@ -170,13 +126,13 @@ func (w *wsConn) readMessage() ([]byte, error) {
 		switch plen {
 		case 126:
 			var ext [2]byte
-			if _, err := io.ReadFull(w.conn, ext[:]); err != nil {
+			if _, err := io.ReadFull(w.r, ext[:]); err != nil {
 				return nil, err
 			}
 			plen = uint64(binary.BigEndian.Uint16(ext[:]))
 		case 127:
 			var ext [8]byte
-			if _, err := io.ReadFull(w.conn, ext[:]); err != nil {
+			if _, err := io.ReadFull(w.r, ext[:]); err != nil {
 				return nil, err
 			}
 			plen = binary.BigEndian.Uint64(ext[:])
@@ -185,12 +141,12 @@ func (w *wsConn) readMessage() ([]byte, error) {
 			return nil, errors.New("frame too large")
 		}
 		payload := make([]byte, plen)
-		if _, err := io.ReadFull(w.conn, payload); err != nil {
+		if _, err := io.ReadFull(w.r, payload); err != nil {
 			return nil, err
 		}
 		if masked {
 			var mk [4]byte
-			if _, err := io.ReadFull(w.conn, mk[:]); err != nil {
+			if _, err := io.ReadFull(w.r, mk[:]); err != nil {
 				return nil, err
 			}
 			for i := range payload {
@@ -217,6 +173,7 @@ func (w *wsConn) readMessage() ([]byte, error) {
 // ------------------------------------------------------------- buttplug ----
 
 type device struct {
+	index      int
 	name       string
 	featureCnt int
 }
@@ -226,7 +183,6 @@ type buttplugClient struct {
 	id       int
 	mu       sync.Mutex
 	devices  map[int]*device
-	listCB   func(name string)
 	stopPoke chan struct{}
 }
 
@@ -245,12 +201,19 @@ func newButtplugClient(ws *wsConn) *buttplugClient {
 	return &buttplugClient{ws: ws, devices: map[int]*device{}, stopPoke: make(chan struct{})}
 }
 
+// send marshals one buttplug message. A nil payload omits the third array
+// element (for messages like Ping that carry no payload).
 func (c *buttplugClient) send(name string, payload any) error {
 	c.mu.Lock()
 	c.id++
 	id := c.id
 	c.mu.Unlock()
-	msg := []any{id, name, payload}
+	var msg []any
+	if payload == nil {
+		msg = []any{id, name}
+	} else {
+		msg = []any{id, name, payload}
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
@@ -271,7 +234,7 @@ func (c *buttplugClient) connect() error {
 	return c.send("StartScanning", map[string]any{})
 }
 
-// handle parses one server message. Returns true once scanning finished.
+// handle parses one server message.
 func (c *buttplugClient) handle(data []byte) {
 	var arr []json.RawMessage
 	if err := json.Unmarshal(data, &arr); err != nil || len(arr) < 2 {
@@ -309,21 +272,25 @@ func (c *buttplugClient) handle(data []byte) {
 				list = []deviceAddedPayload{d}
 			}
 		}
+		c.mu.Lock()
 		for _, d := range list {
 			cnt := featureCount(d.DeviceMessages, "VibrateCmd")
-			c.devices[d.DeviceIndex] = &device{name: d.DeviceName, featureCnt: cnt}
+			c.devices[d.DeviceIndex] = &device{index: d.DeviceIndex, name: d.DeviceName, featureCnt: cnt}
 			if cnt > 0 {
 				fmt.Printf("Vibration device found: %s (%d motor(s))\n", d.DeviceName, cnt)
 			} else {
 				fmt.Printf("Device found (no vibration): %s\n", d.DeviceName)
 			}
 		}
+		c.mu.Unlock()
 	case "DeviceRemoved":
 		var dr struct {
 			DeviceIndex int `json:"DeviceIndex"`
 		}
 		if json.Unmarshal(payload, &dr) == nil {
+			c.mu.Lock()
 			delete(c.devices, dr.DeviceIndex)
+			c.mu.Unlock()
 		}
 	case "ScanningFinished":
 		_ = c.send("StopScanning", map[string]any{})
@@ -355,10 +322,10 @@ func featureCount(raw json.RawMessage, msg string) int {
 		FeatureCount int `json:"FeatureCount"`
 	}
 	if json.Unmarshal(raw, &m) == nil {
-		if f, ok := m[msg]; ok && f.FeatureCount > 0 {
-			return f.FeatureCount
-		}
-		if _, ok := m[msg]; ok {
+		if f, ok := m[msg]; ok {
+			if f.FeatureCount > 0 {
+				return f.FeatureCount
+			}
 			return 1
 		}
 		return 0
@@ -381,20 +348,34 @@ func (c *buttplugClient) pinger(every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for range t.C {
-		if err := c.send("Ping", map[string]any{}); err != nil {
+		if err := c.send("Ping", nil); err != nil {
 			return
 		}
 	}
 }
 
-func (c *buttplugClient) vibrateAll(speed float64) {
+// snapshotDevices returns a copy of the device list. Callers must not hold mu.
+func (c *buttplugClient) snapshotDevices() []*device {
 	c.mu.Lock()
-	devices := make([]*device, 0, len(c.devices))
+	defer c.mu.Unlock()
+	list := make([]*device, 0, len(c.devices))
 	for _, d := range c.devices {
-		devices = append(devices, d)
+		list = append(list, d)
 	}
-	c.mu.Unlock()
-	for _, d := range devices {
+	return list
+}
+
+func (c *buttplugClient) hasVibrationDevice() bool {
+	for _, d := range c.snapshotDevices() {
+		if d.featureCnt > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *buttplugClient) vibrateAll(speed float64) {
+	for _, d := range c.snapshotDevices() {
 		if d.featureCnt == 0 {
 			continue
 		}
@@ -402,25 +383,14 @@ func (c *buttplugClient) vibrateAll(speed float64) {
 		for i := range speeds {
 			speeds[i] = map[string]any{"Index": i, "Speed": speed}
 		}
-		_ = c.send("VibrateCmd", map[string]any{"DeviceIndex": indexOf(c.devices, d), "Speeds": speeds})
+		_ = c.send("VibrateCmd", map[string]any{"DeviceIndex": d.index, "Speeds": speeds})
 	}
 }
 
 func (c *buttplugClient) stopAll() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for idx := range c.devices {
-		_ = c.send("StopDeviceCmd", map[string]any{"DeviceIndex": idx})
+	for _, d := range c.snapshotDevices() {
+		_ = c.send("StopDeviceCmd", map[string]any{"DeviceIndex": d.index})
 	}
-}
-
-func indexOf(m map[int]*device, d *device) int {
-	for i, v := range m {
-		if v == d {
-			return i
-		}
-	}
-	return 0
 }
 
 // ----------------------------------------------------------------- main ----
@@ -478,17 +448,10 @@ func main() {
 	case <-time.After(15 * time.Second):
 	}
 
-	hasDevice := false
-	client.mu.Lock()
-	for _, d := range client.devices {
-		if d.featureCnt > 0 {
-			hasDevice = true
-		}
-	}
-	client.mu.Unlock()
-	if !hasDevice {
+	if !client.hasVibrationDevice() {
 		fmt.Println("No vibration-capable device found.")
 		fmt.Println("Pair your toy in Intiface Central, then run this program again.")
+		client.stopAll()
 		os.Exit(1)
 	}
 
@@ -499,6 +462,7 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
 	var lastFlash time.Time
+	var flashGen uint64
 	var wasRed bool
 	tick := time.NewTicker(pollEvery)
 	defer tick.Stop()
@@ -510,15 +474,17 @@ func main() {
 			fmt.Println("Stopped.")
 			return
 		case <-tick.C:
-			x, y, ok := clientTopLeft()
-			if !ok {
-				continue
-			}
-			red := redPixelAt(x, y)
+			red := redPixelNearTop()
 			if red && !wasRed && time.Since(lastFlash) >= flashMinGap {
 				lastFlash = time.Now()
+				gen := atomic.AddUint64(&flashGen, 1)
 				client.vibrateAll(1.0)
-				time.AfterFunc(vibeTime, func() { client.vibrateAll(0.0) })
+				time.AfterFunc(vibeTime, func() {
+					// Only stop if no newer flash happened meanwhile.
+					if atomic.LoadUint64(&flashGen) == gen {
+						client.vibrateAll(0.0)
+					}
+				})
 			}
 			wasRed = red
 		}
