@@ -201,20 +201,19 @@ func newButtplugClient(ws *wsConn) *buttplugClient {
 	return &buttplugClient{ws: ws, devices: map[int]*device{}, stopPoke: make(chan struct{})}
 }
 
-// send marshals one buttplug message. A nil payload omits the third array
-// element (for messages like Ping that carry no payload).
-func (c *buttplugClient) send(name string, payload any) error {
+// send marshals one buttplug message in the wire format the server expects:
+// a JSON array containing a single object keyed by the message name, with
+// the Id inside the contents: [{"VibrateCmd":{"Id":1,...}}].
+func (c *buttplugClient) send(name string, fields map[string]any) error {
 	c.mu.Lock()
 	c.id++
 	id := c.id
 	c.mu.Unlock()
-	var msg []any
-	if payload == nil {
-		msg = []any{id, name}
-	} else {
-		msg = []any{id, name, payload}
+	if fields == nil {
+		fields = map[string]any{}
 	}
-	data, err := json.Marshal(msg)
+	fields["Id"] = id
+	data, err := json.Marshal([]any{map[string]any{name: fields}})
 	if err != nil {
 		return err
 	}
@@ -228,27 +227,32 @@ func (c *buttplugClient) connect() error {
 	}); err != nil {
 		return err
 	}
-	if err := c.send("RequestDeviceList", map[string]any{}); err != nil {
+	if err := c.send("RequestDeviceList", nil); err != nil {
 		return err
 	}
-	return c.send("StartScanning", map[string]any{})
+	return c.send("StartScanning", nil)
 }
 
-// handle parses one server message.
+// handle parses one server payload: a JSON array of objects, each keyed by
+// the message name with the contents as value: [{"ServerInfo":{...}}].
 func (c *buttplugClient) handle(data []byte) {
-	var arr []json.RawMessage
-	if err := json.Unmarshal(data, &arr); err != nil || len(arr) < 2 {
+	var envelope []json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		fmt.Printf("Unparseable server message: %s\n", data)
 		return
 	}
-	var name string
-	if err := json.Unmarshal(arr[1], &name); err != nil {
-		return
+	for _, raw := range envelope {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil || len(obj) != 1 {
+			continue
+		}
+		for name, contents := range obj {
+			c.handleOne(name, contents)
+		}
 	}
-	var payload json.RawMessage
-	if len(arr) >= 3 {
-		payload = arr[2]
-	}
+}
 
+func (c *buttplugClient) handleOne(name string, payload json.RawMessage) {
 	switch name {
 	case "ServerInfo":
 		var si serverInfoPayload
@@ -293,14 +297,18 @@ func (c *buttplugClient) handle(data []byte) {
 			c.mu.Unlock()
 		}
 	case "ScanningFinished":
-		_ = c.send("StopScanning", map[string]any{})
+		_ = c.send("StopScanning", nil)
 		select {
 		case <-c.stopPoke:
 		default:
 			close(c.stopPoke)
 		}
 	case "Error":
-		fmt.Printf("Server error: %s\n", string(payload))
+		var e struct {
+			ErrorMessage string `json:"ErrorMessage"`
+		}
+		_ = json.Unmarshal(payload, &e)
+		fmt.Printf("Server error: %s\n", e.ErrorMessage)
 	}
 }
 
@@ -401,10 +409,13 @@ func main() {
 
 	var ws *wsConn
 	var err error
-	for attempt := 0; attempt < 60; attempt++ {
+	for attempt := 1; attempt <= 60; attempt++ {
 		ws, err = dialWebSocket(serverURL, serverPath)
 		if err == nil {
 			break
+		}
+		if attempt%5 == 0 {
+			fmt.Printf("Still waiting for the server... (attempt %d, last error: %v)\n", attempt, err)
 		}
 		time.Sleep(2 * time.Second)
 	}
