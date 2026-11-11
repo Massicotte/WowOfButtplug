@@ -173,9 +173,10 @@ func (w *wsConn) readMessage() ([]byte, error) {
 // ------------------------------------------------------------- buttplug ----
 
 type device struct {
-	index      int
-	name       string
-	featureCnt int
+	index         int
+	name          string
+	vibrateCnt    int // motors exposed via VibrateCmd (v3)
+	scalarVibeCnt int // vibrate actuators exposed via ScalarCmd (v4)
 }
 
 type buttplugClient struct {
@@ -226,16 +227,12 @@ func (c *buttplugClient) send(name string, fields map[string]any) error {
 }
 
 func (c *buttplugClient) connect() error {
-	if err := c.send("RequestServerInfo", map[string]any{
+	// Only the handshake goes out first: the server rejects anything it
+	// receives before it has answered RequestServerInfo.
+	return c.send("RequestServerInfo", map[string]any{
 		"ClientName":     "WowOfButtplug",
 		"MessageVersion": 3,
-	}); err != nil {
-		return err
-	}
-	if err := c.send("RequestDeviceList", nil); err != nil {
-		return err
-	}
-	return c.send("StartScanning", nil)
+	})
 }
 
 // handle parses one server payload: a JSON array of objects, each keyed by
@@ -269,6 +266,9 @@ func (c *buttplugClient) handleOne(name string, payload json.RawMessage) {
 		if si.MaxPingTime > 0 && si.MessageVersion < 3 {
 			go c.pinger(time.Duration(si.MaxPingTime) * time.Millisecond / 3)
 		}
+		// Handshake answered: now request the device list and start scanning.
+		_ = c.send("RequestDeviceList", nil)
+		_ = c.send("StartScanning", nil)
 	case "DeviceAdded", "DeviceList":
 		var list []deviceAddedPayload
 		if name == "DeviceList" {
@@ -285,14 +285,14 @@ func (c *buttplugClient) handleOne(name string, payload json.RawMessage) {
 			}
 		}
 		for _, d := range list {
-			cnt := featureCount(d.DeviceMessages, "VibrateCmd")
+			vibCnt, scalCnt := vibrationFeatures(d.DeviceMessages)
 			c.mu.Lock()
-			c.devices[d.DeviceIndex] = &device{index: d.DeviceIndex, name: d.DeviceName, featureCnt: cnt}
+			c.devices[d.DeviceIndex] = &device{index: d.DeviceIndex, name: d.DeviceName, vibrateCnt: vibCnt, scalarVibeCnt: scalCnt}
 			test := !c.testSent
 			c.testSent = true
 			c.mu.Unlock()
-			if cnt > 0 {
-				fmt.Printf("Vibration device found: %s (%d motor(s))\n", d.DeviceName, cnt)
+			if vibCnt > 0 || scalCnt > 0 {
+				fmt.Printf("Vibration device found: %s (%d motor(s))\n", d.DeviceName, vibCnt+scalCnt)
 				if test {
 					// Short test buzz so the user can tell the chain works.
 					fmt.Println("Sending a short test vibration (0.3s)...")
@@ -339,30 +339,72 @@ func serverInfoName(payload json.RawMessage) string {
 	return si.ServerName
 }
 
-// featureCount handles both v3 ({"VibrateCmd":{"FeatureCount":1}}) and
-// v1/v2 (["VibrateCmd"]) DeviceMessages formats.
-func featureCount(raw json.RawMessage, msg string) int {
-	var m map[string]struct {
-		FeatureCount int `json:"FeatureCount"`
-	}
+// vibrationFeatures extracts how a device can vibrate from its
+// DeviceMessages field, across protocol versions:
+//   - v3: {"VibrateCmd": {"FeatureCount": 2}}            -> vibrateCnt
+//   - v4: {"ScalarCmd": [{"ActuatorType": "Vibrate",
+//     "FeatureCount": 2}]}                          -> scalarVibeCnt
+//   - v1/v2: ["VibrateCmd"]                              -> vibrateCnt
+func vibrationFeatures(raw json.RawMessage) (vibrateCnt, scalarVibeCnt int) {
+	// v3/v4: map of message name to its feature descriptors.
+	var m map[string]json.RawMessage
 	if json.Unmarshal(raw, &m) == nil {
-		if f, ok := m[msg]; ok {
-			if f.FeatureCount > 0 {
-				return f.FeatureCount
+		if v, ok := m["VibrateCmd"]; ok {
+			vibrateCnt = countFeatures(v, "")
+		}
+		if v, ok := m["ScalarCmd"]; ok {
+			scalarVibeCnt = countFeatures(v, "Vibrate")
+		}
+		return vibrateCnt, scalarVibeCnt
+	}
+	// v1/v2: array of message names.
+	var arr []string
+	if json.Unmarshal(raw, &arr) == nil {
+		for _, s := range arr {
+			if s == "VibrateCmd" {
+				return 1, 0
+			}
+		}
+	}
+	return 0, 0
+}
+
+// countFeatures sums FeatureCount in a message's descriptors. Descriptors can
+// be a single object (v3), an array of objects (v4), or absent (count 1).
+// actuator filters v4 ScalarCmd descriptors; empty accepts all.
+func countFeatures(raw json.RawMessage, actuator string) int {
+	// Single object form: {"FeatureCount": 2} or {"FeatureCount": 2, "ActuatorType": "Vibrate"}.
+	var obj struct {
+		FeatureCount int    `json:"FeatureCount"`
+		ActuatorType string `json:"ActuatorType"`
+	}
+	if json.Unmarshal(raw, &obj) == nil {
+		if actuator == "" || obj.ActuatorType == actuator {
+			if obj.FeatureCount > 0 {
+				return obj.FeatureCount
 			}
 			return 1
 		}
 		return 0
 	}
-	var arr []string
+	// Array form (v4): [{"ActuatorType": "Vibrate", "FeatureCount": 2}, ...].
+	var arr []struct {
+		FeatureCount int    `json:"FeatureCount"`
+		ActuatorType string `json:"ActuatorType"`
+	}
+	total := 0
 	if json.Unmarshal(raw, &arr) == nil {
-		for _, s := range arr {
-			if s == msg {
-				return 1
+		for _, f := range arr {
+			if actuator == "" || f.ActuatorType == actuator {
+				if f.FeatureCount > 0 {
+					total += f.FeatureCount
+				} else {
+					total++
+				}
 			}
 		}
 	}
-	return 0
+	return total
 }
 
 func (c *buttplugClient) pinger(every time.Duration) {
@@ -391,7 +433,7 @@ func (c *buttplugClient) snapshotDevices() []*device {
 
 func (c *buttplugClient) hasVibrationDevice() bool {
 	for _, d := range c.snapshotDevices() {
-		if d.featureCnt > 0 {
+		if d.vibrateCnt > 0 || d.scalarVibeCnt > 0 {
 			return true
 		}
 	}
@@ -400,14 +442,20 @@ func (c *buttplugClient) hasVibrationDevice() bool {
 
 func (c *buttplugClient) vibrateAll(speed float64) {
 	for _, d := range c.snapshotDevices() {
-		if d.featureCnt == 0 {
-			continue
+		switch {
+		case d.vibrateCnt > 0:
+			speeds := make([]map[string]any, d.vibrateCnt)
+			for i := range speeds {
+				speeds[i] = map[string]any{"Index": i, "Speed": speed}
+			}
+			_ = c.send("VibrateCmd", map[string]any{"DeviceIndex": d.index, "Speeds": speeds})
+		case d.scalarVibeCnt > 0:
+			scalars := make([]map[string]any, d.scalarVibeCnt)
+			for i := range scalars {
+				scalars[i] = map[string]any{"Index": i, "Scalar": speed, "ActuatorType": "Vibrate"}
+			}
+			_ = c.send("ScalarCmd", map[string]any{"DeviceIndex": d.index, "Scalars": scalars})
 		}
-		speeds := make([]map[string]any, d.featureCnt)
-		for i := range speeds {
-			speeds[i] = map[string]any{"Index": i, "Speed": speed}
-		}
-		_ = c.send("VibrateCmd", map[string]any{"DeviceIndex": d.index, "Speeds": speeds})
 	}
 }
 
