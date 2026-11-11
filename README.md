@@ -4,7 +4,7 @@ Portage de l'addon [Butthurt](https://github.com/Maikatura/Butthurt) pour **Worl
 
 Quand votre personnage prend des dégâts dans WoW, l'addon fait clignoter un petit pixel rouge dans le coin supérieur gauche de l'écran. Le pont `WowOfButtplug.exe` lit ce pixel et fait vibrer votre jouet (Lovense ou tout appareil compatible Buttplug) via **Intiface Central**.
 
-```
+``` 
 WoW: Forever ──(pixel rouge)──> WowOfButtplug.exe ──(ws://localhost:12345)──> Intiface Central ──> votre jouet
 ```
 
