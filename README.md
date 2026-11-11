@@ -2,20 +2,7 @@
 
 Portage de l'addon [Butthurt](https://github.com/Maikatura/Butthurt) pour **World of Warcraft: Forever** (client 1.60.1, interface 16001), avec son propre pont Windows intégré (pas de .NET, rien à compiler).
 
-L'addon dessine dans le coin supérieur gauche de l'écran deux petits blocs de 5×5 px : un bloc **coloré** (le type d'événement) et un bloc **gris** (l'intensité). Le pont `WowOfButtplug.exe` les lit à l'écran et fait vibrer votre jouet (Lovense ou tout appareil compatible Buttplug) via **Intiface Central**.
-
-## Événements vibrés
-
-| Événement | Couleur du bloc | Vibration |
-|---|---|---|
-| Dégâts subis | rouge | intensité et durée proportionnelles aux dégâts (30–100 %, 0,3–0,8 s) |
-| Soin reçu | vert | intensité proportionnelle au soin, douce |
-| Coffre / butin | jaune | 50 %, 0,3 s |
-| Minage | cyan | 40 %, 0,4 s |
-| Message privé | magenta | double impulsion à 70 % |
-| Message de guilde | bleu | 30 %, 0,25 s |
-
-Chaque vibration s'active ou se désactive en jeu avec la commande **`/wob`** (ou `/butthurt`) qui ouvre un petit panneau à cocher ; les réglages sont sauvegardés par personnage.
+Quand votre personnage prend des dégâts, ou quand vous lancez un sort avec succès (soin donné, attaque, sort offensif ou utilitaire), l'addon fait clignoter un petit pixel rouge dans le coin supérieur gauche de l'écran. Le pont `WowOfButtplug.exe` lit ce pixel et fait vibrer votre jouet (Lovense ou tout appareil compatible Buttplug) via **Intiface Central**.
 
 ```
 WoW: Forever ──(pixel rouge)──> WowOfButtplug.exe ──(ws://localhost:12345)──> Intiface Central ──> votre jouet

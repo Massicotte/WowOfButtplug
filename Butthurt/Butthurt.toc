@@ -2,7 +2,7 @@
 ## Title: Butthurt
 ## Notes: Alerts when the player takes damage.
 ## Author: Maikatura
-## Version: 2.0-forever
+## Version: 1.0-forever
 ## SavedVariables: ButthurtSavedVariables
 
 Butthurt.lua

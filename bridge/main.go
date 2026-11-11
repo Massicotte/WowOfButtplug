@@ -614,7 +614,7 @@ func session(ws *wsConn, sig chan os.Signal) bool {
 
 	var lastFlash time.Time
 	var flashGen uint64
-	lastEvent := ""
+	var wasRed bool
 	tick := time.NewTicker(pollEvery)
 	defer tick.Stop()
 	// Rescan every 30s until a vibration device shows up.
@@ -636,58 +636,20 @@ func session(ws *wsConn, sig chan os.Signal) bool {
 				_ = client.send("StartScanning", nil)
 			}
 		case <-tick.C:
-			event, intensity := samplePixels()
-			if event != "" && event != lastEvent && time.Since(lastFlash) >= flashMinGap {
+			red := redPixelNearTop()
+			if red && !wasRed && time.Since(lastFlash) >= flashMinGap {
 				lastFlash = time.Now()
-				fmt.Printf("Event: %s (%d%%)\n", event, int(intensity*100))
-				client.vibrateEvent(event, intensity, &flashGen)
-			}
-			lastEvent = event
-		}
-	}
-}
-
-// vibrateEvent drives the toys according to the event type and intensity.
-func (c *buttplugClient) vibrateEvent(event string, intensity float64, flashGen *uint64) {
-	pulse := func(speed float64, on time.Duration, off time.Duration, count int) {
-		gen := atomic.AddUint64(flashGen, 1)
-		for i := 0; i < count; i++ {
-			delay := time.Duration(i) * (on + off)
-			time.AfterFunc(delay, func() {
-				if atomic.LoadUint64(flashGen) != gen {
-					return
-				}
-				c.vibrateAll(speed)
-				time.AfterFunc(on, func() {
-					if atomic.LoadUint64(flashGen) == gen {
-						c.vibrateAll(0)
+				gen := atomic.AddUint64(&flashGen, 1)
+				client.vibrateAll(1.0)
+				time.AfterFunc(vibeTime, func() {
+					// Only stop if no newer flash happened meanwhile.
+					if atomic.LoadUint64(&flashGen) == gen {
+						client.vibrateAll(0.0)
 					}
 				})
-			})
+			}
+			wasRed = red
 		}
-	}
-
-	switch event {
-	case "damage":
-		speed := 0.3 + 0.7*intensity
-		if speed > 1 {
-			speed = 1
-		}
-		pulse(speed, time.Duration(300+500*intensity)*time.Millisecond, 0, 1)
-	case "heal":
-		speed := 0.2 + 0.3*intensity
-		if speed > 1 {
-			speed = 1
-		}
-		pulse(speed, 300*time.Millisecond, 0, 1)
-	case "loot":
-		pulse(0.5, 300*time.Millisecond, 0, 1)
-	case "mining":
-		pulse(0.4, 400*time.Millisecond, 0, 1)
-	case "whisper":
-		pulse(0.7, 150*time.Millisecond, 150*time.Millisecond, 2)
-	case "guild":
-		pulse(0.3, 250*time.Millisecond, 0, 1)
 	}
 }
 
