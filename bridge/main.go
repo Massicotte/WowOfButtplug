@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -172,11 +173,20 @@ func (w *wsConn) readMessage() ([]byte, error) {
 
 // ------------------------------------------------------------- buttplug ----
 
+// vibeFeature is a v4 feature we can vibrate.
+type vibeFeature struct {
+	featureIndex int
+	maxValue     int
+}
+
 type device struct {
-	index         int
-	name          string
-	vibrateCnt    int // motors exposed via VibrateCmd (v3)
-	scalarVibeCnt int // vibrate actuators exposed via ScalarCmd (v4)
+	index int
+	name  string
+	// Protocol v3 capabilities.
+	vibrateCnt    int // motors exposed via VibrateCmd
+	scalarVibeCnt int // vibrate actuators exposed via ScalarCmd
+	// Protocol v4 capabilities.
+	v4Vibes []vibeFeature
 }
 
 type buttplugClient struct {
@@ -185,17 +195,7 @@ type buttplugClient struct {
 	mu       sync.Mutex
 	devices  map[int]*device
 	testSent bool
-}
-
-type serverInfoPayload struct {
-	MessageVersion int  `json:"MessageVersion"`
-	MaxPingTime    uint `json:"MaxPingTime"`
-}
-
-type deviceAddedPayload struct {
-	DeviceIndex    int             `json:"DeviceIndex"`
-	DeviceName     string          `json:"DeviceName"`
-	DeviceMessages json.RawMessage `json:"DeviceMessages"`
+	version  int // negotiated protocol major version (3 or 4)
 }
 
 var debug = os.Getenv("WOWOFBUTTPLUG_DEBUG") == "1"
@@ -226,9 +226,20 @@ func (c *buttplugClient) send(name string, fields map[string]any) error {
 	return c.ws.sendText(data)
 }
 
+// connect starts the handshake. We ask for protocol v4 first; if the server
+// rejects it we retry with v3 (see the Error handler in handleOne).
 func (c *buttplugClient) connect() error {
-	// Only the handshake goes out first: the server rejects anything it
-	// receives before it has answered RequestServerInfo.
+	return c.send("RequestServerInfo", map[string]any{
+		"ClientName":           "WowOfButtplug",
+		"ProtocolVersionMajor": 4,
+		"ProtocolVersionMinor": 0,
+	})
+}
+
+func (c *buttplugClient) fallbackV3() error {
+	c.mu.Lock()
+	c.version = 3
+	c.mu.Unlock()
 	return c.send("RequestServerInfo", map[string]any{
 		"ClientName":     "WowOfButtplug",
 		"MessageVersion": 3,
@@ -260,52 +271,33 @@ func (c *buttplugClient) handle(data []byte) {
 func (c *buttplugClient) handleOne(name string, payload json.RawMessage) {
 	switch name {
 	case "ServerInfo":
-		var si serverInfoPayload
+		var si struct {
+			ServerName           string `json:"ServerName"`
+			MessageVersion       int    `json:"MessageVersion"`       // v3 and earlier
+			ProtocolVersionMajor int    `json:"ProtocolVersionMajor"` // v4
+			MaxPingTime          uint   `json:"MaxPingTime"`
+		}
 		_ = json.Unmarshal(payload, &si)
-		fmt.Printf("Connected to %s (buttplug v%d)\n", serverInfoName(payload), si.MessageVersion)
-		if si.MaxPingTime > 0 && si.MessageVersion < 3 {
+		version := si.ProtocolVersionMajor
+		if version == 0 {
+			version = si.MessageVersion
+		}
+		c.mu.Lock()
+		c.version = version
+		c.mu.Unlock()
+		fmt.Printf("Connected to %s (buttplug v%d)\n", si.ServerName, version)
+		if si.MaxPingTime > 0 && version < 4 {
 			go c.pinger(time.Duration(si.MaxPingTime) * time.Millisecond / 3)
 		}
 		// Handshake answered: now request the device list and start scanning.
 		_ = c.send("RequestDeviceList", nil)
 		_ = c.send("StartScanning", nil)
 	case "DeviceAdded", "DeviceList":
-		var list []deviceAddedPayload
-		if name == "DeviceList" {
-			var dl struct {
-				Devices []deviceAddedPayload `json:"Devices"`
-			}
-			if json.Unmarshal(payload, &dl) == nil {
-				list = dl.Devices
-			}
-		} else {
-			var d deviceAddedPayload
-			if json.Unmarshal(payload, &d) == nil {
-				list = []deviceAddedPayload{d}
-			}
-		}
+		// v3 sends DeviceAdded (single device) and DeviceList (array);
+		// v4 only sends DeviceList with Devices as a map of index -> device.
+		list := parseDeviceList(name, payload)
 		for _, d := range list {
-			vibCnt, scalCnt := vibrationFeatures(d.DeviceMessages)
-			c.mu.Lock()
-			c.devices[d.DeviceIndex] = &device{index: d.DeviceIndex, name: d.DeviceName, vibrateCnt: vibCnt, scalarVibeCnt: scalCnt}
-			test := !c.testSent
-			c.testSent = true
-			c.mu.Unlock()
-			if vibCnt > 0 || scalCnt > 0 {
-				fmt.Printf("Vibration device found: %s (%d motor(s))\n", d.DeviceName, vibCnt+scalCnt)
-				if test {
-					// Short test buzz so the user can tell the chain works.
-					fmt.Println("Sending a short test vibration (0.3s)...")
-					c.vibrateAll(1.0)
-					time.AfterFunc(300*time.Millisecond, func() { c.vibrateAll(0.0) })
-					time.AfterFunc(time.Second, func() { c.vibrateAll(0.0) })
-				}
-			} else {
-				fmt.Printf("Device found (no vibration support): %s\n", d.DeviceName)
-				if debug {
-					fmt.Printf("[debug] device messages: %s\n", d.DeviceMessages)
-				}
-			}
+			c.registerDevice(d)
 		}
 	case "DeviceRemoved":
 		var dr struct {
@@ -324,29 +316,130 @@ func (c *buttplugClient) handleOne(name string, payload json.RawMessage) {
 			ErrorMessage string `json:"ErrorMessage"`
 		}
 		_ = json.Unmarshal(payload, &e)
+		c.mu.Lock()
+		handshakePending := c.version == 0
+		c.mu.Unlock()
+		if handshakePending {
+			// Server refused our v4 handshake: retry with v3.
+			fmt.Printf("Server refused protocol v4 (%s), retrying with v3...\n", e.ErrorMessage)
+			_ = c.fallbackV3()
+			return
+		}
 		fmt.Printf("Server error: %s\n", e.ErrorMessage)
+	case "Ok":
+		// Nothing to do.
 	}
 }
 
-func serverInfoName(payload json.RawMessage) string {
-	var si struct {
-		ServerName string `json:"ServerName"`
+// registerDevice stores a device and sends the one-time test vibration.
+func (c *buttplugClient) registerDevice(d *device) {
+	c.mu.Lock()
+	c.devices[d.index] = d
+	test := !c.testSent
+	c.testSent = true
+	vibes := len(d.v4Vibes) + d.vibrateCnt + d.scalarVibeCnt
+	c.mu.Unlock()
+	if vibes > 0 {
+		fmt.Printf("Vibration device found: %s (%d motor(s))\n", d.name, vibes)
+		if test {
+			// Short test buzz so the user can tell the chain works.
+			fmt.Println("Sending a short test vibration (0.3s)...")
+			c.vibrateAll(1.0)
+			time.AfterFunc(300*time.Millisecond, func() { c.vibrateAll(0.0) })
+			time.AfterFunc(time.Second, func() { c.vibrateAll(0.0) })
+		}
+	} else {
+		fmt.Printf("Device found (no vibration support): %s\n", d.name)
+		if debug {
+			fmt.Printf("[debug] raw device: %+v\n", d)
+		}
 	}
-	_ = json.Unmarshal(payload, &si)
-	if si.ServerName == "" {
-		return "buttplug server"
-	}
-	return si.ServerName
 }
 
-// vibrationFeatures extracts how a device can vibrate from its
-// DeviceMessages field, across protocol versions:
-//   - v3: {"VibrateCmd": {"FeatureCount": 2}}            -> vibrateCnt
-//   - v4: {"ScalarCmd": [{"ActuatorType": "Vibrate",
-//     "FeatureCount": 2}]}                          -> scalarVibeCnt
-//   - v1/v2: ["VibrateCmd"]                              -> vibrateCnt
+// parseDeviceList extracts devices from a DeviceAdded or DeviceList payload,
+// handling both the v3 shape (array of devices with DeviceMessages) and the
+// v4 shape (map of index -> device with DeviceFeatures).
+func parseDeviceList(name string, payload json.RawMessage) []*device {
+	var out []*device
+	if name == "DeviceAdded" {
+		if d := parseV3Device(payload); d != nil {
+			out = append(out, d)
+		}
+		return out
+	}
+	var dl struct {
+		Devices json.RawMessage `json:"Devices"`
+	}
+	if json.Unmarshal(payload, &dl) != nil {
+		return out
+	}
+	// v3: array of devices.
+	var arr []json.RawMessage
+	if json.Unmarshal(dl.Devices, &arr) == nil {
+		for _, raw := range arr {
+			if d := parseV3Device(raw); d != nil {
+				out = append(out, d)
+			}
+		}
+		return out
+	}
+	// v4: map of index -> device.
+	var m map[string]json.RawMessage
+	if json.Unmarshal(dl.Devices, &m) == nil {
+		for _, raw := range m {
+			if d := parseV4Device(raw); d != nil {
+				out = append(out, d)
+			}
+		}
+	}
+	return out
+}
+
+func parseV3Device(raw json.RawMessage) *device {
+	var d struct {
+		DeviceIndex    int             `json:"DeviceIndex"`
+		DeviceName     string          `json:"DeviceName"`
+		DeviceMessages json.RawMessage `json:"DeviceMessages"`
+	}
+	if json.Unmarshal(raw, &d) != nil {
+		return nil
+	}
+	vibCnt, scalCnt := vibrationFeatures(d.DeviceMessages)
+	return &device{index: d.DeviceIndex, name: d.DeviceName, vibrateCnt: vibCnt, scalarVibeCnt: scalCnt}
+}
+
+func parseV4Device(raw json.RawMessage) *device {
+	var d struct {
+		DeviceIndex    int    `json:"DeviceIndex"`
+		DeviceName     string `json:"DeviceName"`
+		DeviceFeatures map[string]struct {
+			FeatureIndex int `json:"FeatureIndex"`
+			Output       map[string]struct {
+				Value []int `json:"Value"`
+			} `json:"Output"`
+		} `json:"DeviceFeatures"`
+	}
+	if json.Unmarshal(raw, &d) != nil {
+		return nil
+	}
+	dev := &device{index: d.DeviceIndex, name: d.DeviceName}
+	for _, f := range d.DeviceFeatures {
+		if out, ok := f.Output["Vibrate"]; ok {
+			max := 1
+			if len(out.Value) >= 2 && out.Value[1] > 0 {
+				max = out.Value[1]
+			}
+			dev.v4Vibes = append(dev.v4Vibes, vibeFeature{featureIndex: f.FeatureIndex, maxValue: max})
+		}
+	}
+	return dev
+}
+
+// vibrationFeatures extracts how a device can vibrate from its v3
+// DeviceMessages field:
+//   - v3: {"VibrateCmd": [{"StepCount": 20}]} or {"ScalarCmd": [{"ActuatorType": "Vibrate", "StepCount": 20}]}
+//   - v1/v2: ["VibrateCmd"] or {"VibrateCmd": {"FeatureCount": 2}}
 func vibrationFeatures(raw json.RawMessage) (vibrateCnt, scalarVibeCnt int) {
-	// v3/v4: map of message name to its feature descriptors.
 	var m map[string]json.RawMessage
 	if json.Unmarshal(raw, &m) == nil {
 		if v, ok := m["VibrateCmd"]; ok {
@@ -357,7 +450,6 @@ func vibrationFeatures(raw json.RawMessage) (vibrateCnt, scalarVibeCnt int) {
 		}
 		return vibrateCnt, scalarVibeCnt
 	}
-	// v1/v2: array of message names.
 	var arr []string
 	if json.Unmarshal(raw, &arr) == nil {
 		for _, s := range arr {
@@ -369,11 +461,11 @@ func vibrationFeatures(raw json.RawMessage) (vibrateCnt, scalarVibeCnt int) {
 	return 0, 0
 }
 
-// countFeatures sums FeatureCount in a message's descriptors. Descriptors can
-// be a single object (v3), an array of objects (v4), or absent (count 1).
-// actuator filters v4 ScalarCmd descriptors; empty accepts all.
+// countFeatures counts feature descriptors in a v3 message attribute:
+// either an array of attribute objects (one per feature) or a single
+// object with FeatureCount. actuator filters ScalarCmd descriptors;
+// empty accepts all.
 func countFeatures(raw json.RawMessage, actuator string) int {
-	// Single object form: {"FeatureCount": 2} or {"FeatureCount": 2, "ActuatorType": "Vibrate"}.
 	var obj struct {
 		FeatureCount int    `json:"FeatureCount"`
 		ActuatorType string `json:"ActuatorType"`
@@ -387,7 +479,6 @@ func countFeatures(raw json.RawMessage, actuator string) int {
 		}
 		return 0
 	}
-	// Array form (v4): [{"ActuatorType": "Vibrate", "FeatureCount": 2}, ...].
 	var arr []struct {
 		FeatureCount int    `json:"FeatureCount"`
 		ActuatorType string `json:"ActuatorType"`
@@ -433,13 +524,15 @@ func (c *buttplugClient) snapshotDevices() []*device {
 
 func (c *buttplugClient) hasVibrationDevice() bool {
 	for _, d := range c.snapshotDevices() {
-		if d.vibrateCnt > 0 || d.scalarVibeCnt > 0 {
+		if d.vibrateCnt > 0 || d.scalarVibeCnt > 0 || len(d.v4Vibes) > 0 {
 			return true
 		}
 	}
 	return false
 }
 
+// vibrateAll sets every vibration-capable device to speed (0.0-1.0), using
+// the command matching the negotiated protocol version.
 func (c *buttplugClient) vibrateAll(speed float64) {
 	for _, d := range c.snapshotDevices() {
 		switch {
@@ -455,13 +548,29 @@ func (c *buttplugClient) vibrateAll(speed float64) {
 				scalars[i] = map[string]any{"Index": i, "Scalar": speed, "ActuatorType": "Vibrate"}
 			}
 			_ = c.send("ScalarCmd", map[string]any{"DeviceIndex": d.index, "Scalars": scalars})
+		case len(d.v4Vibes) > 0:
+			for _, f := range d.v4Vibes {
+				value := int(math.Round(speed * float64(f.maxValue)))
+				_ = c.send("OutputCmd", map[string]any{
+					"DeviceIndex":  d.index,
+					"FeatureIndex": f.featureIndex,
+					"Command":      map[string]any{"Vibrate": map[string]any{"Value": value}},
+				})
+			}
 		}
 	}
 }
 
 func (c *buttplugClient) stopAll() {
+	c.mu.Lock()
+	version := c.version
+	c.mu.Unlock()
 	for _, d := range c.snapshotDevices() {
-		_ = c.send("StopDeviceCmd", map[string]any{"DeviceIndex": d.index})
+		if version >= 4 {
+			_ = c.send("StopCmd", map[string]any{"DeviceIndex": d.index})
+		} else {
+			_ = c.send("StopDeviceCmd", map[string]any{"DeviceIndex": d.index})
+		}
 	}
 }
 

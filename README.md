@@ -54,7 +54,7 @@ Pour arrêter : `Ctrl+C` dans la fenêtre du pont.
 - **Le combat log n'existe pas sur le client Forever** : `COMBAT_LOG_EVENT_UNFILTERED` et `CombatLogGetCurrentEventInfo()` ne sont pas disponibles pour les addons. La détection de dégâts utilise donc une baisse de vie via `UNIT_HEALTH`.
 - **Valeurs secrètes** : sur Forever, `UnitHealth` peut renvoyer une valeur « secrète » (règles Midnight) qu'il est interdit de comparer. L'addon détecte ce cas (`issecretvalue`) et bascule alors en mode dégradé : le pixel clignote à chaque changement de vie en combat (soins inclus).
 - **Pas de Ace3** : l'addon est autonome (évite les problèmes connus d'AceDB sur ce client).
-- **Pont remplacé** : `WowOfButtplug.exe` (Go, code source dans [`bridge/`](bridge/)) remplace `Butthurt.exe` — plus besoin du .NET Runtime ni de l'exécutable du dépôt d'origine. Il lit le pixel via l'API Win32 et parle le protocole Buttplug v3 en WebSocket, sans dépendance externe.
+- **Pont remplacé** : `WowOfButtplug.exe` (Go, code source dans [`bridge/`](bridge/)) remplace `Butthurt.exe` — plus besoin du .NET Runtime ni de l'exécutable du dépôt d'origine. Il lit le pixel via l'API Win32 et parle les protocoles Buttplug v3 et v4 en WebSocket (négociation automatique, avec repli v3 si le serveur refuse v4), sans dépendance externe.
 
 ## Crédits
 
