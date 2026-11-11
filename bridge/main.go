@@ -183,7 +183,7 @@ type buttplugClient struct {
 	id       int
 	mu       sync.Mutex
 	devices  map[int]*device
-	stopPoke chan struct{}
+	testSent bool
 }
 
 type serverInfoPayload struct {
@@ -197,8 +197,10 @@ type deviceAddedPayload struct {
 	DeviceMessages json.RawMessage `json:"DeviceMessages"`
 }
 
+var debug = os.Getenv("WOWOFBUTTPLUG_DEBUG") == "1"
+
 func newButtplugClient(ws *wsConn) *buttplugClient {
-	return &buttplugClient{ws: ws, devices: map[int]*device{}, stopPoke: make(chan struct{})}
+	return &buttplugClient{ws: ws, devices: map[int]*device{}}
 }
 
 // send marshals one buttplug message in the wire format the server expects:
@@ -216,6 +218,9 @@ func (c *buttplugClient) send(name string, fields map[string]any) error {
 	data, err := json.Marshal([]any{map[string]any{name: fields}})
 	if err != nil {
 		return err
+	}
+	if debug {
+		fmt.Printf("[debug] -> %s\n", data)
 	}
 	return c.ws.sendText(data)
 }
@@ -236,6 +241,9 @@ func (c *buttplugClient) connect() error {
 // handle parses one server payload: a JSON array of objects, each keyed by
 // the message name with the contents as value: [{"ServerInfo":{...}}].
 func (c *buttplugClient) handle(data []byte) {
+	if debug {
+		fmt.Printf("[debug] <- %s\n", data)
+	}
 	var envelope []json.RawMessage
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		fmt.Printf("Unparseable server message: %s\n", data)
@@ -276,17 +284,29 @@ func (c *buttplugClient) handleOne(name string, payload json.RawMessage) {
 				list = []deviceAddedPayload{d}
 			}
 		}
-		c.mu.Lock()
 		for _, d := range list {
 			cnt := featureCount(d.DeviceMessages, "VibrateCmd")
+			c.mu.Lock()
 			c.devices[d.DeviceIndex] = &device{index: d.DeviceIndex, name: d.DeviceName, featureCnt: cnt}
+			test := !c.testSent
+			c.testSent = true
+			c.mu.Unlock()
 			if cnt > 0 {
 				fmt.Printf("Vibration device found: %s (%d motor(s))\n", d.DeviceName, cnt)
+				if test {
+					// Short test buzz so the user can tell the chain works.
+					fmt.Println("Sending a short test vibration (0.3s)...")
+					c.vibrateAll(1.0)
+					time.AfterFunc(300*time.Millisecond, func() { c.vibrateAll(0.0) })
+					time.AfterFunc(time.Second, func() { c.vibrateAll(0.0) })
+				}
 			} else {
-				fmt.Printf("Device found (no vibration): %s\n", d.DeviceName)
+				fmt.Printf("Device found (no vibration support): %s\n", d.DeviceName)
+				if debug {
+					fmt.Printf("[debug] device messages: %s\n", d.DeviceMessages)
+				}
 			}
 		}
-		c.mu.Unlock()
 	case "DeviceRemoved":
 		var dr struct {
 			DeviceIndex int `json:"DeviceIndex"`
@@ -295,14 +315,10 @@ func (c *buttplugClient) handleOne(name string, payload json.RawMessage) {
 			c.mu.Lock()
 			delete(c.devices, dr.DeviceIndex)
 			c.mu.Unlock()
+			fmt.Println("Device removed.")
 		}
 	case "ScanningFinished":
 		_ = c.send("StopScanning", nil)
-		select {
-		case <-c.stopPoke:
-		default:
-			close(c.stopPoke)
-		}
 	case "Error":
 		var e struct {
 			ErrorMessage string `json:"ErrorMessage"`
@@ -403,87 +419,64 @@ func (c *buttplugClient) stopAll() {
 
 // ----------------------------------------------------------------- main ----
 
-func main() {
-	fmt.Println("WowOfButtplug - Butthurt bridge for WoW: Forever")
-	fmt.Println("Waiting for the Intiface Central server on ws://" + serverURL + serverPath + " ...")
-
-	var ws *wsConn
-	var err error
-	for attempt := 1; attempt <= 60; attempt++ {
-		ws, err = dialWebSocket(serverURL, serverPath)
-		if err == nil {
-			break
-		}
-		if attempt%5 == 0 {
-			fmt.Printf("Still waiting for the server... (attempt %d, last error: %v)\n", attempt, err)
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if err != nil {
-		fmt.Println("Could not reach the buttplug server:", err)
-		fmt.Println("Start Intiface Central, click 'Start Server', then run this program again.")
-		os.Exit(1)
-	}
-	defer ws.conn.Close()
-
+// session runs one connection until it drops or sig fires. Returns true if
+// the program should exit (signal received), false to reconnect.
+func session(ws *wsConn, sig chan os.Signal) bool {
 	client := newButtplugClient(ws)
 	if err := client.connect(); err != nil {
 		fmt.Println("Handshake failed:", err)
-		os.Exit(1)
+		return false
 	}
 
+	dropped := make(chan struct{})
 	msgs := make(chan []byte, 64)
 	go func() {
+		defer close(dropped)
 		for {
 			data, err := ws.readMessage()
 			if err != nil {
-				close(msgs)
 				return
 			}
-			msgs <- data
+			select {
+			case msgs <- data:
+			case <-dropped:
+				return
+			}
 		}
 	}()
-
 	go func() {
 		for data := range msgs {
 			client.handle(data)
 		}
-		fmt.Println("Connection to the buttplug server lost.")
-		client.stopAll()
-		os.Exit(1)
 	}()
 
-	// Give the scan some time to find devices.
-	select {
-	case <-client.stopPoke:
-	case <-time.After(15 * time.Second):
-	}
-
-	if !client.hasVibrationDevice() {
-		fmt.Println("No vibration-capable device found.")
-		fmt.Println("Pair your toy in Intiface Central, then run this program again.")
-		client.stopAll()
-		os.Exit(1)
-	}
-
+	fmt.Println("Waiting for devices... (turn your toy on and connect it in Intiface Central)")
 	fmt.Println("Ready. Keep the WoW window in the foreground and take some damage!")
 	fmt.Println("Press Ctrl+C to stop.")
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
 	var lastFlash time.Time
 	var flashGen uint64
 	var wasRed bool
 	tick := time.NewTicker(pollEvery)
 	defer tick.Stop()
+	// Rescan every 30s until a vibration device shows up.
+	rescan := time.NewTicker(30 * time.Second)
+	defer rescan.Stop()
 
 	for {
 		select {
 		case <-sig:
 			client.stopAll()
 			fmt.Println("Stopped.")
-			return
+			return true
+		case <-dropped:
+			fmt.Println("Connection to the buttplug server lost. Reconnecting...")
+			client.stopAll()
+			return false
+		case <-rescan.C:
+			if !client.hasVibrationDevice() {
+				_ = client.send("StartScanning", nil)
+			}
 		case <-tick.C:
 			red := redPixelNearTop()
 			if red && !wasRed && time.Since(lastFlash) >= flashMinGap {
@@ -499,5 +492,45 @@ func main() {
 			}
 			wasRed = red
 		}
+	}
+}
+
+func main() {
+	fmt.Println("WowOfButtplug - Butthurt bridge for WoW: Forever")
+	fmt.Println("Waiting for the Intiface Central server on ws://" + serverURL + serverPath + " ...")
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+
+	for {
+		var ws *wsConn
+		var err error
+		for attempt := 1; attempt <= 60; attempt++ {
+			ws, err = dialWebSocket(serverURL, serverPath)
+			if err == nil {
+				break
+			}
+			if attempt%5 == 0 {
+				fmt.Printf("Still waiting for the server... (attempt %d, last error: %v)\n", attempt, err)
+			}
+			select {
+			case <-sig:
+				fmt.Println("Stopped.")
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+		if err != nil {
+			fmt.Println("Could not reach the buttplug server:", err)
+			fmt.Println("Start Intiface Central, click 'Start Server', then run this program again.")
+			return
+		}
+
+		if session(ws, sig) {
+			ws.conn.Close()
+			return
+		}
+		ws.conn.Close()
+		time.Sleep(2 * time.Second)
 	}
 }
